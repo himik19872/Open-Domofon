@@ -1,6 +1,6 @@
 #!/bin/sh
 #===============================================================================
-# OpenIPC Doorphone Installer
+# OpenIPC Doorphone Installer v2.1
 # https://github.com/OpenIPC/intercom
 #===============================================================================
 
@@ -13,7 +13,8 @@ NC='\033[0m'
 
 clear
 echo "${BLUE}==========================================${NC}"
-echo "${BLUE}  OpenIPC Doorphone Installer v2.0${NC}"
+echo "${BLUE}  OpenIPC Doorphone Installer v2.1${NC}"
+echo "${BLUE}  with MQTT, Telegram & Sound Support${NC}"
 echo "${BLUE}==========================================${NC}"
 echo ""
 
@@ -55,18 +56,17 @@ mkdir -p /var/www/a
 mkdir -p /usr/share/sounds/doorphone
 mkdir -p /root/backups
 mkdir -p /etc/baresip
+mkdir -p /etc/webui
 echo "${GREEN}  ✓ Directories created${NC}"
 echo ""
 
 #-----------------------------------------------------------------------------
-# Step 3: Сохраняем оригинальный header.cgi если он существует
+# Step 3: Сохраняем оригинальный header.cgi
 #-----------------------------------------------------------------------------
 echo "${BLUE}Step 3: Backing up original header.cgi...${NC}"
 if [ -f /var/www/cgi-bin/header.cgi ]; then
     cp /var/www/cgi-bin/header.cgi /var/www/cgi-bin/header.cgi.original
     echo "${GREEN}  ✓ Original header.cgi backed up${NC}"
-else
-    echo "${YELLOW}  ⚠️ Original header.cgi not found${NC}"
 fi
 echo ""
 
@@ -81,10 +81,25 @@ if [ ! -f /etc/rc.local ]; then
     chmod +x /etc/rc.local
 fi
 
-if ! grep -q "chmod 666 $UART_SELECTED" /etc/rc.local; then
-    sed -i "/exit 0/i chmod 666 $UART_SELECTED" /etc/rc.local
+if ! grep -q "stty -F $UART_SELECTED" /etc/rc.local; then
+    sed -i "/exit 0/i stty -F $UART_SELECTED 115200 cs8 -cstopb -parenb raw" /etc/rc.local
 fi
-echo "${GREEN}  ✓ UART configured${NC}"
+
+if ! grep -q "mqtt_client.sh" /etc/rc.local; then
+    cat >> /etc/rc.local << 'EOF'
+# Start MQTT client
+if [ -f /etc/mqtt.conf ]; then
+    . /etc/mqtt.conf
+    if [ "$MQTT_ENABLED" = "true" ]; then
+        /usr/bin/mqtt_client.sh monitor > /dev/null 2>&1 &
+    fi
+fi
+exit 0
+EOF
+fi
+
+chmod +x /etc/rc.local
+echo "${GREEN}  ✓ UART and services configured${NC}"
 echo ""
 
 #-----------------------------------------------------------------------------
@@ -94,7 +109,7 @@ echo "${BLUE}Step 5: Downloading files from GitHub...${NC}"
 
 BASE_URL="https://raw.githubusercontent.com/OpenIPC/intercom/main"
 
-# Функция для скачивания с проверкой
+# Функция для скачивания
 download_file() {
     url="$1"
     dest="$2"
@@ -129,35 +144,29 @@ download_file() {
     return 1
 }
 
-# Счетчики
+# Список файлов для скачивания
 TOTAL=0
 SUCCESS=0
 FAILED=""
 
-#-----------------------------------------------------------------------------
-# Скачивание CGI скриптов из www/cgi-bin/p/
-#-----------------------------------------------------------------------------
-echo "  - Downloading CGI scripts from www/cgi-bin/p/..."
-
+# CGI скрипты
+echo "  - Downloading CGI scripts..."
 P_FILES="
-address.cgi
-backup_manager.cgi
-common.cgi
-door_api.cgi
-door_history.cgi
 door_keys.cgi
-footer.cgi
-header.cgi
-motor.cgi
-play_sound.cgi
-qr_api.cgi
-qr_generator.cgi
-roi.cgi
-sip_api.cgi
 sip_manager.cgi
-sip_save.cgi
-sounds.cgi
+qr_generator.cgi
 temp_keys.cgi
+sounds.cgi
+door_history.cgi
+mqtt.cgi
+mqtt_status.cgi
+mqtt_api.cgi
+backup_manager.cgi
+backup_api.cgi
+door_api.cgi
+sip_api.cgi
+sip_save.cgi
+play_sound.cgi
 upload_final.cgi
 "
 
@@ -171,17 +180,13 @@ for file in $P_FILES; do
     fi
 done
 
-#-----------------------------------------------------------------------------
-# Скачивание backup.cgi из www/cgi-bin/
-#-----------------------------------------------------------------------------
-echo "  - Downloading backup.cgi from www/cgi-bin/..."
+# backup.cgi
 TOTAL=$((TOTAL + 1))
 if download_file "$BASE_URL/www/cgi-bin/backup.cgi" "/var/www/cgi-bin/backup.cgi" "backup.cgi"; then
     chmod +x "/var/www/cgi-bin/backup.cgi"
     SUCCESS=$((SUCCESS + 1))
 else
-    echo "    ⚠️ backup.cgi not found in repository - creating minimal version"
-    # Создаем минимальный backup.cgi прямо на камере
+    # Создаем минимальный backup.cgi
     cat > /var/www/cgi-bin/backup.cgi << 'EOF'
 #!/bin/sh
 echo "Content-type: text/html; charset=utf-8"
@@ -189,140 +194,115 @@ echo ""
 IP=$(ip addr show | grep -o '192\.168\.[0-9]*\.[0-9]*' | head -1)
 [ -z "$IP" ] && IP="192.168.1.4"
 echo '<!DOCTYPE html>'
-echo '<html>'
-echo '<head>'
+echo '<html><head>'
 echo '<meta charset="UTF-8">'
 echo '<meta http-equiv="refresh" content="2;url=http://'$IP':8080/cgi-bin/p/backup_manager.cgi">'
-echo '</head>'
-echo '<body>'
+echo '</head><body>'
 echo '<p>🔁 Redirecting to Backup Manager on port 8080...</p>'
 echo '<p><a href="http://'$IP':8080/cgi-bin/p/backup_manager.cgi">Click here if not redirected</a></p>'
-echo '</body>'
-echo '</html>'
+echo '</body></html>'
 EOF
     chmod +x /var/www/cgi-bin/backup.cgi
     SUCCESS=$((SUCCESS + 1))
 fi
 
-#-----------------------------------------------------------------------------
-# Скачивание скриптов из usr/bin/
-#-----------------------------------------------------------------------------
-echo "  - Downloading scripts from usr/bin/..."
+# Системные скрипты
+echo "  - Downloading system scripts..."
+BIN_FILES="
+door_monitor.sh
+mqtt_client.sh
+check_temp_keys.sh
+"
 
-# door_monitor.sh
-TOTAL=$((TOTAL + 1))
-echo "    Downloading: door_monitor.sh"
-if download_file "$BASE_URL/usr/bin/door_monitor.sh" "/usr/bin/door_monitor.sh" "door_monitor.sh"; then
-    chmod +x "/usr/bin/door_monitor.sh"
-    # Подставляем правильный UART в скачанный скрипт
-    sed -i "s|/dev/ttyS0|$UART_SELECTED|g" /usr/bin/door_monitor.sh
-    sed -i "s|/dev/ttyAMA0|$UART_SELECTED|g" /usr/bin/door_monitor.sh
-    SUCCESS=$((SUCCESS + 1))
-else
-    echo "    ⚠️ door_monitor.sh not found in repository - creating minimal version"
-    cat > /usr/bin/door_monitor.sh << EOF
-#!/bin/sh
-UART_DEV="$UART_SELECTED"
-KEYS_FILE="/etc/door_keys.conf"
-LOG_FILE="/var/log/door_monitor.log"
-PID_FILE="/var/run/door_monitor.pid"
+for file in $BIN_FILES; do
+    TOTAL=$((TOTAL + 1))
+    if download_file "$BASE_URL/usr/bin/$file" "/usr/bin/$file" "$file"; then
+        chmod +x "/usr/bin/$file"
+        # Подставляем правильный UART
+        sed -i "s|/dev/ttyS0|$UART_SELECTED|g" "/usr/bin/$file" 2>/dev/null
+        sed -i "s|/dev/ttyAMA0|$UART_SELECTED|g" "/usr/bin/$file" 2>/dev/null
+        SUCCESS=$((SUCCESS + 1))
+    else
+        FAILED="$FAILED\n      - usr/bin/$file"
+    fi
+done
 
-log() {
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1" >> "\$LOG_FILE"
-}
+# Конфиги
+echo "  - Downloading config files..."
+CONF_FILES="
+door_keys.conf
+mqtt.conf
+doorphone_sounds.conf
+baresip/accounts
+baresip/call_number
+"
 
-case "\$1" in
-    start)
-        log "Door monitor starting on \$UART_DEV"
-        while true; do
-            if [ -c "\$UART_DEV" ]; then
-                read line < "\$UART_DEV" 2>/dev/null
-                [ -n "\$line" ] && log "Received: \$line"
-            fi
-            sleep 0.1
-        done &
-        echo \$! > "\$PID_FILE"
-        ;;
-    stop)
-        [ -f "\$PID_FILE" ] && kill \$(cat "\$PID_FILE") 2>/dev/null && rm -f "\$PID_FILE"
-        ;;
-    restart)
-        \$0 stop; sleep 1; \$0 start
-        ;;
-    *)
-        echo "Usage: \$0 {start|stop|restart}"
-        exit 1
-        ;;
-esac
-EOF
-    chmod +x /usr/bin/door_monitor.sh
-    SUCCESS=$((SUCCESS + 1))
-fi
+for file in $CONF_FILES; do
+    TOTAL=$((TOTAL + 1))
+    dest="/etc/$file"
+    mkdir -p "$(dirname "$dest")"
+    if download_file "$BASE_URL/etc/$file" "$dest" "$file"; then
+        chmod 644 "$dest" 2>/dev/null
+        SUCCESS=$((SUCCESS + 1))
+    else
+        # Создаем базовые конфиги
+        case "$file" in
+            door_keys.conf)
+                echo "# Door Keys Database" > /etc/door_keys.conf
+                echo "12345678|Admin|$(date +%Y-%m-%d)" >> /etc/door_keys.conf
+                echo "qrdemo|QR Test|$(date +%Y-%m-%d)" >> /etc/door_keys.conf
+                echo "0000|Master|$(date +%Y-%m-%d)" >> /etc/door_keys.conf
+                chmod 666 /etc/door_keys.conf
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            mqtt.conf)
+                echo '# MQTT Configuration' > /etc/mqtt.conf
+                echo 'MQTT_ENABLED="false"' >> /etc/mqtt.conf
+                echo 'MQTT_HOST="192.168.1.30"' >> /etc/mqtt.conf
+                echo 'MQTT_PORT="1883"' >> /etc/mqtt.conf
+                echo 'MQTT_USER="user"' >> /etc/mqtt.conf
+                echo 'MQTT_PASS="passwd"' >> /etc/mqtt.conf
+                echo 'MQTT_CLIENT_ID="openipc_doorphone"' >> /etc/mqtt.conf
+                echo 'MQTT_TOPIC_PREFIX="doorphone"' >> /etc/mqtt.conf
+                echo 'MQTT_DISCOVERY="false"' >> /etc/mqtt.conf
+                echo 'MQTT_DISCOVERY_PREFIX="homeassistant"' >> /etc/mqtt.conf
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            doorphone_sounds.conf)
+                echo '# Sound Configuration' > /etc/doorphone_sounds.conf
+                echo 'SOUND_KEY_ACCEPT="beep"' >> /etc/doorphone_sounds.conf
+                echo 'SOUND_KEY_DENY="denied"' >> /etc/doorphone_sounds.conf
+                echo 'SOUND_DOOR_OPEN="door_open"' >> /etc/doorphone_sounds.conf
+                echo 'SOUND_DOOR_CLOSE="door_close"' >> /etc/doorphone_sounds.conf
+                echo 'SOUND_BUTTON="beep"' >> /etc/doorphone_sounds.conf
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            baresip/call_number)
+                echo "100" > /etc/baresip/call_number
+                SUCCESS=$((SUCCESS + 1))
+                ;;
+            *)
+                FAILED="$FAILED\n      - etc/$file"
+                ;;
+        esac
+    fi
+done
 
-# check_temp_keys.sh
-TOTAL=$((TOTAL + 1))
-echo "    Downloading: check_temp_keys.sh"
-if download_file "$BASE_URL/usr/bin/check_temp_keys.sh" "/usr/bin/check_temp_keys.sh" "check_temp_keys.sh"; then
-    chmod +x "/usr/bin/check_temp_keys.sh"
-    SUCCESS=$((SUCCESS + 1))
-else
-    echo "    ✓ check_temp_keys.sh will be created during cron setup"
-    SUCCESS=$((SUCCESS + 1))
-fi
-
-#-----------------------------------------------------------------------------
-# Скачивание конфигурационных файлов из etc/
-#-----------------------------------------------------------------------------
-echo "  - Downloading config files from etc/..."
-
-# Скачиваем door_keys.conf
-TOTAL=$((TOTAL + 1))
-if download_file "$BASE_URL/etc/door_keys.conf" "/etc/door_keys.conf" "door_keys.conf"; then
-    chmod 666 "/etc/door_keys.conf"
-    SUCCESS=$((SUCCESS + 1))
-else
-    echo "    ⚠️ door_keys.conf not found - will be created during setup"
-fi
-
-# Скачиваем baresip/accounts
-TOTAL=$((TOTAL + 1))
-mkdir -p /etc/baresip
-if download_file "$BASE_URL/etc/baresip/accounts" "/etc/baresip/accounts" "baresip/accounts"; then
-    SUCCESS=$((SUCCESS + 1))
-else
-    echo "    ⚠️ baresip/accounts not found - will be configured later"
-fi
-
-# Скачиваем baresip/call_number
-TOTAL=$((TOTAL + 1))
-if download_file "$BASE_URL/etc/baresip/call_number" "/etc/baresip/call_number" "baresip/call_number"; then
-    SUCCESS=$((SUCCESS + 1))
-else
-    echo "    ⚠️ baresip/call_number not found - using default 100"
-    echo "100" > /etc/baresip/call_number
-fi
-
-#-----------------------------------------------------------------------------
-# Скачивание звуковых файлов из sounds/ (опционально)
-#-----------------------------------------------------------------------------
-echo "  - Downloading sound files from sounds/..."
+# Звуки (опционально)
+echo "  - Downloading sound files..."
 SOUND_FILES="ring.pcm door_open.pcm door_close.pcm denied.pcm beep.pcm"
 for file in $SOUND_FILES; do
     TOTAL=$((TOTAL + 1))
     if download_file "$BASE_URL/sounds/$file" "/usr/share/sounds/doorphone/$file" "$file" 2>/dev/null; then
         SUCCESS=$((SUCCESS + 1))
     else
-        # Не показываем ошибку для звуков - они опциональны
-        SUCCESS=$((SUCCESS + 1))
+        SUCCESS=$((SUCCESS + 1)) # Не показываем ошибку для звуков
     fi
 done
 
 echo "${GREEN}  ✓ Downloaded $SUCCESS of $TOTAL files${NC}"
-
-if [ -n "$FAILED" ]; then
-    echo "${RED}  ✗ Failed files:${NC}$FAILED"
-    echo ""
-fi
+[ -n "$FAILED" ] && echo "${RED}  ✗ Failed files:$FAILED${NC}"
+echo ""
 
 #-----------------------------------------------------------------------------
 # Step 6: Установка Bootstrap
@@ -339,29 +319,13 @@ fi
 
 if [ -f /var/www/a/bootstrap.min.css ] && [ -s /var/www/a/bootstrap.min.css ]; then
     echo "${GREEN}  ✓ Bootstrap installed${NC}"
-else
-    echo "${YELLOW}  ⚠️ Bootstrap download failed, continuing with minimal CSS${NC}"
 fi
 echo ""
 
 #-----------------------------------------------------------------------------
-# Step 7: Установка header.cgi (копируем из p/ в корень)
+# Step 7: Настройка автозапуска для door_monitor
 #-----------------------------------------------------------------------------
-echo "${BLUE}Step 7: Installing header.cgi...${NC}"
-
-if [ -f "/var/www/cgi-bin/p/header.cgi" ]; then
-    cp "/var/www/cgi-bin/p/header.cgi" "/var/www/cgi-bin/header.cgi"
-    chmod +x "/var/www/cgi-bin/header.cgi"
-    echo "${GREEN}  ✓ header.cgi installed to /var/www/cgi-bin/${NC}"
-else
-    echo "${YELLOW}  ⚠️ header.cgi not found in p/ directory${NC}"
-fi
-echo ""
-
-#-----------------------------------------------------------------------------
-# Step 8: Настройка автозапуска для door_monitor
-#-----------------------------------------------------------------------------
-echo "${BLUE}Step 8: Configuring door_monitor autostart...${NC}"
+echo "${BLUE}Step 7: Configuring door_monitor autostart...${NC}"
 
 cat > /etc/init.d/S99door << 'EOF'
 #!/bin/sh
@@ -372,7 +336,7 @@ PIDFILE=/var/run/$NAME.pid
 
 start() {
     printf "Starting $NAME: "
-    start-stop-daemon -S -b -m -p $PIDFILE -x $DAEMON -- start
+    start-stop-daemon -S -b -m -p $PIDFILE -x $DAEMON
     echo "OK"
 }
 
@@ -390,13 +354,8 @@ restart() {
 }
 
 case "$1" in
-    start|stop|restart)
-        $1
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart}"
-        exit 1
-        ;;
+    start|stop|restart) $1 ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
 esac
 exit 0
 EOF
@@ -406,9 +365,9 @@ echo "${GREEN}  ✓ Autostart configured${NC}"
 echo ""
 
 #-----------------------------------------------------------------------------
-# Step 9: Настройка backup сервера на порту 8080
+# Step 8: Настройка backup сервера на порту 8080
 #-----------------------------------------------------------------------------
-echo "${BLUE}Step 9: Setting up backup server on port 8080...${NC}"
+echo "${BLUE}Step 8: Setting up backup server on port 8080...${NC}"
 
 if ! grep -q "httpd -p 8080" /etc/rc.local; then
     sed -i "/exit 0/i httpd -p 8080 -h /var/www \&" /etc/rc.local
@@ -420,52 +379,27 @@ echo "${GREEN}  ✓ Backup server started on port 8080${NC}"
 echo ""
 
 #-----------------------------------------------------------------------------
-# Step 10: Создание базы ключей (если не скачалась)
+# Step 9: Настройка cron для временных ключей
 #-----------------------------------------------------------------------------
-echo "${BLUE}Step 10: Creating keys database...${NC}"
-
-if [ ! -f /etc/door_keys.conf ] || [ ! -s /etc/door_keys.conf ]; then
-    touch /etc/door_keys.conf
-    chmod 666 /etc/door_keys.conf
-    echo "12345678|Admin|$(date +%Y-%m-%d)" >> /etc/door_keys.conf
-    echo "qrdemo|QR Test|$(date +%Y-%m-%d)" >> /etc/door_keys.conf
-    echo "0000|Master|$(date +%Y-%m-%d)" >> /etc/door_keys.conf
-    echo "${GREEN}  ✓ Test keys added${NC}"
-else
-    echo "${GREEN}  ✓ Keys database already exists${NC}"
-fi
-echo ""
-
-#-----------------------------------------------------------------------------
-# Step 11: Настройка cron для временных ключей
-#-----------------------------------------------------------------------------
-echo "${BLUE}Step 11: Setting up cron for temporary keys...${NC}"
+echo "${BLUE}Step 9: Setting up cron for temporary keys...${NC}"
 
 mkdir -p /etc/crontabs
 if [ -f /usr/bin/check_temp_keys.sh ]; then
     if ! grep -q "check_temp_keys" /etc/crontabs/root 2>/dev/null; then
         echo "0 * * * * /usr/bin/check_temp_keys.sh" >> /etc/crontabs/root
         echo "${GREEN}  ✓ Cron job added (runs every hour)${NC}"
-    else
-        echo "${GREEN}  ✓ Cron job already exists${NC}"
     fi
-else
-    echo "${YELLOW}  ⚠️ check_temp_keys.sh not found, cron not configured${NC}"
 fi
 echo ""
 
 #-----------------------------------------------------------------------------
-# Step 12: Запуск сервисов
+# Step 10: Запуск сервисов
 #-----------------------------------------------------------------------------
-echo "${BLUE}Step 12: Starting services...${NC}"
+echo "${BLUE}Step 10: Starting services...${NC}"
 
-# Убеждаемся что UART имеет правильные права
 chmod 666 $UART_SELECTED 2>/dev/null
-
-# Запускаем door_monitor
 /etc/init.d/S99door restart
 
-# Запускаем baresip если есть конфиг
 if [ -f /etc/baresip/accounts ] && [ -s /etc/baresip/accounts ]; then
     if command -v baresip >/dev/null 2>&1; then
         killall baresip 2>/dev/null
@@ -474,35 +408,19 @@ if [ -f /etc/baresip/accounts ] && [ -s /etc/baresip/accounts ]; then
     fi
 fi
 
-echo ""
-
-#-----------------------------------------------------------------------------
-# Step 13: Проверка установки
-#-----------------------------------------------------------------------------
-echo "${BLUE}Step 13: Verifying installation...${NC}"
-
-MISSING=0
-for file in door_keys.cgi backup_manager.cgi qr_generator.cgi temp_keys.cgi; do
-    if [ -f "/var/www/cgi-bin/p/$file" ] && [ -s "/var/www/cgi-bin/p/$file" ]; then
-        echo "  ✓ $file present and not empty"
-    else
-        echo "  ${RED}✗ $file MISSING or EMPTY${NC}"
-        MISSING=1
+if [ -f /etc/mqtt.conf ]; then
+    . /etc/mqtt.conf
+    if [ "$MQTT_ENABLED" = "true" ]; then
+        /usr/bin/mqtt_client.sh monitor > /dev/null 2>&1 &
+        echo "${GREEN}  ✓ MQTT client started${NC}"
     fi
-done
-
-if [ $MISSING -eq 0 ]; then
-    echo "${GREEN}  ✓ All key files present${NC}"
-else
-    echo "${RED}  ✗ Some files are missing or empty${NC}"
-    echo "     Check GitHub repository: https://github.com/OpenIPC/intercom"
 fi
 echo ""
 
 #-----------------------------------------------------------------------------
-# Step 14: Очистка
+# Step 11: Очистка
 #-----------------------------------------------------------------------------
-echo "${BLUE}Step 14: Cleanup...${NC}"
+echo "${BLUE}Step 11: Cleanup...${NC}"
 rm -rf /tmp/intercom_* 2>/dev/null
 echo "${GREEN}  ✓ Cleanup complete${NC}"
 echo ""
@@ -520,6 +438,8 @@ echo ""
 echo "${BLUE}📱 Main web interface:${NC} http://$IP"
 echo "${BLUE}💾 Backup manager:${NC}     http://$IP:8080/cgi-bin/p/backup_manager.cgi"
 echo "${BLUE}🔌 UART device:${NC}        $UART_SELECTED"
+echo "${BLUE}🤖 MQTT Broker:${NC}        Configure in MQTT page"
+echo "${BLUE}📱 Telegram Bot:${NC}       Configure in Extensions → Telegram"
 echo ""
 echo "${BLUE}🔑 Test keys:${NC}"
 echo "  - 12345678 (Admin)"
@@ -527,11 +447,12 @@ echo "  - qrdemo (QR Test)"
 echo "  - 0000 (Master)"
 echo ""
 echo "${BLUE}📋 Commands:${NC}"
-echo "  Check status:  ${YELLOW}ps | grep -E 'door_monitor|httpd'${NC}"
+echo "  Check status:  ${YELLOW}ps | grep -E 'door_monitor|mqtt|httpd'${NC}"
 echo "  View logs:     ${YELLOW}tail -f /var/log/door_monitor.log${NC}"
+echo "                 ${YELLOW}tail -f /var/log/mqtt.log${NC}"
 echo "  Add key:       ${YELLOW}echo \"key|name|date\" >> /etc/door_keys.conf${NC}"
 echo "  Restart:       ${YELLOW}/etc/init.d/S99door restart${NC}"
-echo "  Update files:  ${YELLOW}curl -sL https://raw.githubusercontent.com/OpenIPC/intercom/main/install.sh | sh${NC}"
+echo "  Update:        ${YELLOW}curl -sL https://raw.githubusercontent.com/OpenIPC/intercom/main/install.sh | sh${NC}"
 echo ""
 echo "${GREEN}==========================================${NC}"
 echo "${GREEN}Enjoy your OpenIPC Doorphone!${NC}"
